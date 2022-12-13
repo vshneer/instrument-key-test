@@ -1,0 +1,130 @@
+module Main where
+
+import Daml.Script
+
+import qualified DA.Map as M (empty, fromList)
+import qualified DA.Set as S
+
+import Daml.Finance.Interface.Instrument.Base.Instrument qualified as Instrument
+import Daml.Finance.Interface.Holding.Factory.Account qualified as AccountFactory
+import Daml.Finance.Interface.Holding.Factory.Holding qualified as Holding
+import Daml.Finance.Interface.Holding.Factory.Account qualified as Account (Create(..))
+import Daml.Finance.Interface.Holding.Account
+
+import Daml.Finance.Interface.Types.Common (AccountKey(..), Id(..), InstrumentKey(..))
+
+import Instrument (InstrumentToken(..))
+import Account (Account, CreditHolding(..), AccountFactory(..))
+import Holding (HoldingFactory(..))
+
+data TestParties = TestParties 
+  with
+    custodian: Party
+    issuer: Party
+    depository: Party
+
+data Factories = Factories
+  with
+    accountFactoryCid: ContractId AccountFactory.F
+    holdingFactoryCid: ContractId Holding.Factory
+
+testDepositWithInstrument : Script ()
+testDepositWithInstrument = script do
+
+  testParties@TestParties{..} <- setupParties
+  
+  factories@Factories{..} <- createFactories testParties
+
+  let instrumentKey = InstrumentKey with
+        depository
+        id = Id "SecurityToken"
+        version = "1"
+        issuer=issuer
+  createInstrument testParties instrumentKey
+
+  let accountKey = AccountKey with custodian, owner=issuer, id = Id $ partyToText issuer
+  
+  accCid <- fromInterfaceContractId @Account.Account <$> createAccount testParties factories accountKey
+
+  submitMulti [custodian,issuer] [] do exerciseCmd accCid CreditHolding with instrumentKey, amt = 10
+
+  pure()
+
+testDepositNOInstrument : Script ()
+testDepositNOInstrument = script do
+
+  testParties@TestParties{..} <- setupParties
+  
+  factories@Factories{..} <- createFactories testParties
+
+  let instrumentKey = InstrumentKey with
+        depository
+        id = Id "SecurityToken"
+        version = "1"
+        issuer=issuer
+  
+  -- HERE I SKIP CREATION OF THE INSTRUMENT CONTRACT
+  -- createInstrument testParties instrumentKey
+
+  let accountKey = AccountKey with custodian, owner=issuer, id = Id $ partyToText issuer
+  
+  accCid <- fromInterfaceContractId @Account.Account <$> createAccount testParties factories accountKey
+
+  -- and CreditHolding is still working fine
+  submitMulti [custodian,issuer] [] do exerciseCmd accCid CreditHolding with instrumentKey, amt = 10
+
+  pure()
+
+
+setupParties: Script(TestParties)
+setupParties = do 
+    -- Allocate partes
+  custodian <- allocatePartyWithHint "Custodian" (PartyIdHint "Custodian")
+  issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "Issuer")
+  depository <- allocatePartyWithHint "Depository" (PartyIdHint "Depository")
+  let testParties = TestParties with ..
+  pure testParties
+
+
+createFactories: TestParties -> Script(Factories)
+createFactories TestParties{..} = do
+  -- Create account factory
+  accountFactoryCid <- toInterfaceContractId @AccountFactory.F <$> submit custodian do
+    createCmd AccountFactory
+      with
+        provider = custodian
+        observers = M.empty
+
+  -- Create holding factory
+  holdingFactoryCid <- toInterfaceContractId @Holding.F <$> submit custodian do
+    createCmd HoldingFactory
+      with
+        provider = custodian
+        observers = M.fromList [("PublicObserver", S.singleton $ S.singleton issuer )]
+  let factories = Factories with ..
+  pure factories
+
+
+createInstrument: TestParties -> InstrumentKey -> Script(ContractId Instrument.I)
+createInstrument TestParties{..} instrumentKey = do
+  now <- getTime
+  toInterfaceContractId @Instrument.I <$> submit depository do
+    createCmd InstrumentToken
+      with
+        id = instrumentKey.id
+        description = "Instrument representing Security Token"
+        version = instrumentKey.version
+        observers = M.empty
+        validAsOf = now
+        instrumentKey = instrumentKey
+        ..
+
+createAccount: TestParties -> Factories -> AccountKey -> Script(ContractId
+                             Daml.Finance.Interface.Holding.Account.Account)
+createAccount TestParties{..} Factories{..} account = do
+  let
+    description = "Account of " <> partyToText issuer <> " at " <> partyToText custodian
+    observersL = []
+    observersSet = S.fromList $ map S.singleton observersL
+    observers = M.fromList [("AccountObservers", observersSet)]
+  submitMulti [custodian,issuer] [] do exerciseCmd accountFactoryCid Account.Create with ..

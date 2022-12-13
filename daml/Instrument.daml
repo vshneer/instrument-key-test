@@ -1,0 +1,33 @@
+module Instrument where
+
+import qualified DA.Set as S  (singleton)
+
+import Daml.Finance.Interface.Instrument.Base.Instrument qualified as Instrument (I, View(..), disclosureUpdateReference)
+import Daml.Finance.Interface.Types.Common (Id(..), InstrumentKey(..), Observers)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I, flattenObservers, SetObservers(..), View(..))
+
+template InstrumentToken
+  with
+    depository : Party
+    issuer : Party
+    id: Id
+    validAsOf: Time
+    version: Text
+    description: Text
+    instrumentKey: InstrumentKey
+    observers: Observers
+  where
+    signatory depository
+    observer Disclosure.flattenObservers observers
+
+    interface instance Instrument.I for InstrumentToken where
+      view = Instrument.View with ..
+      getKey = instrumentKey
+      asDisclosure = toInterface @Disclosure.I this
+
+    interface instance Disclosure.I for InstrumentToken where
+      view = Disclosure.View with disclosureControllers = S.singleton $ S.singleton issuer; observers
+      setObservers Disclosure.SetObservers{newObservers} = do
+        cid <- toInterfaceContractId <$> create this with observers = newObservers
+        Instrument.disclosureUpdateReference newObservers instrumentKey cid
+      archive' self = archive (coerceContractId self : ContractId InstrumentToken)

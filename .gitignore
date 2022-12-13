@@ -1,0 +1,16 @@
+/log
+navigator.log
+.lib
+
+# DAML
+/.daml
+
+# UI
+ui/build
+ui/daml.js
+ui/node_modules
+
+# Miscellanea
+.DS_Store
+*.log
+

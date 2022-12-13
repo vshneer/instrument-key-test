@@ -1,0 +1,159 @@
+module Holding where
+
+{-# OPTIONS_GHC -package daml-finance-interface-util #-}
+
+
+import DA.Action (foldlA)
+import DA.Assert ((===))
+import qualified DA.Set as S (toList, delete, insert, null, singleton)
+import Prelude hiding (null)
+
+import Daml.Finance.Interface.Holding.Factory.Holding qualified as HoldingFactory (Create(..), F, HasImplementation(..), Remove(..), View(..))
+import Daml.Finance.Interface.Types.Common (AccountKey(..), InstrumentKey(..), Observers)
+import Daml.Finance.Interface.Holding.Fungible qualified as Fungible (HasImplementation, I, Merge(..), Split(..), SplitResult(..), View(..))
+import Daml.Finance.Interface.Holding.Lockable qualified as Lockable (Acquire(..), I, Lock(..), LockType(..), Release(..), View(..))
+import Daml.Finance.Interface.Holding.Transferable qualified as Transferable (I, Transfer(..), View(..))
+import Daml.Finance.Interface.Holding.Base qualified as Base (I, View(..))
+import Daml.Finance.Interface.Instrument.Base.Instrument qualified as Instrument (qty)
+import Daml.Finance.Interface.Holding.Account qualified as Account (Credit(..), I, R, exerciseInterfaceByKey)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I, SetObservers(..), View(..), flattenObservers)
+import Daml.Finance.Interface.Util.Common (fetchInterfaceByKey)
+import Daml.Finance.Interface.Holding.Util (getLocker)
+
+-- TODO import problem
+-- import Daml.Finance.Holding.Util (reapplyLocks)
+{- ^
+  Could not find module ‘Daml.Finance.Holding.Util’
+  It is not a module in the current program, or in any known package.
+-}
+
+-- | Utility function to reapply holding locks
+reapplyLocks : Lockable.Lock -> ContractId Lockable.I -> Update (ContractId Lockable.I)
+reapplyLocks lock cid =
+  let apply accM context = do
+        cid <- accM
+        exercise cid Lockable.Acquire with newLocker = lock.locker; context; lockType = lock.lockType
+  in foldl apply (pure cid) (S.toList lock.context)
+
+-- | Type synonym for `Factory`.
+type F = HoldingFactory
+-- | Type synonym for `Fungible`.
+type T = Holding
+
+instance Fungible.HasImplementation T
+-- | Implementation of a fungible holding.
+-- `Fungible` implements the interface `Fungible.I` (which requires `Transferable.I`, `Lockable.I`,
+-- `Base.I`, and `Disclosure.I` to be implemented as well).
+template Holding
+  with
+    instrument : InstrumentKey
+      -- ^ The instrument of which units are held.
+    account : AccountKey
+      -- ^ The account at which the holding is held. Defines the holding's owner and custodian.
+    amount : Decimal
+      -- ^ Number of units.
+    lock : Optional Lockable.Lock
+      -- ^ An optional lock of a holding.
+    observers : Observers
+      -- ^ Observers.
+  where
+    signatory account.custodian, account.owner, getLocker this
+    observer Disclosure.flattenObservers observers
+    ensure amount > 0.0
+
+    interface instance Disclosure.I for Holding where
+      view = Disclosure.View with disclosureControllers = S.singleton $ S.singleton account.owner; observers
+      setObservers Disclosure.SetObservers{newObservers} = toInterfaceContractId <$> create this with observers = newObservers
+      archive' self = archive $ fromInterfaceContractId @Holding self
+
+    interface instance Base.I for Holding where
+      asDisclosure = toInterface @Disclosure.I this
+      view = Base.View with
+        instrument
+        account = AccountKey with custodian = account.custodian; owner = account.owner; id = account.id
+        amount
+
+    interface instance Lockable.I for Holding where
+      asHolding = toInterface @Base.I this
+      view = Lockable.View with lock
+      acquire Lockable.Acquire{newLocker; context; lockType} = do
+        newLock <- case (lock, lockType) of
+          (Some existingLock, Lockable.Reentrant) -> pure existingLock with context = context `S.insert` existingLock.context
+          (None, _) -> pure Lockable.Lock with locker = newLocker; context = S.singleton context; lockType
+          _ -> abort "Contract is already locked."
+        toInterfaceContractId <$> create this with lock = Some newLock
+      release Lockable.Release{context} = do
+        let
+          f currentLock = do
+            let newContext = context `S.delete` currentLock.context
+            case (currentLock.lockType, S.null newContext) of
+              (Lockable.Reentrant, False) -> Some currentLock with context = newContext
+              _ -> None
+          releasedLock = lock >>= f
+        toInterfaceContractId <$> create this with lock = releasedLock
+
+    interface instance Transferable.I for Holding where
+      asLockable = toInterface @Lockable.I this
+      view = Transferable.View {}
+      transfer Transferable.Transfer{newOwnerAccount} = do
+        -- Account sanity checks
+        newAccount <- fetchInterfaceByKey @Account.R newOwnerAccount
+        let v = view newAccount
+        v.owner === newOwnerAccount.owner
+        v.custodian === account.custodian
+        -- Create new holding via Credit
+        newHoldingCid <- coerceContractId <$> Account.exerciseInterfaceByKey @Account.I newOwnerAccount newOwnerAccount.owner Account.Credit
+          with
+            quantity = Instrument.qty amount instrument
+        -- Holding sanity checks. This prevents a holding from changing type during a `Transfer` (from e.g., `NonFungible` to `Fungible`)
+        newHolding <- fetch newHoldingCid
+        assertMsg "Sent holding type does not correspond to receiving account holding type" $ interfaceTypeRep newHolding == templateTypeRep @Holding
+        -- Reapply holding locks
+        coerceContractId <$> case lock of
+          Some lock -> reapplyLocks lock newHoldingCid
+          None -> pure newHoldingCid
+
+    interface instance Fungible.I for Holding where
+      asTransferable = toInterface @Transferable.I this
+      view = Fungible.View with modifiers = S.singleton account.owner
+      split Fungible.Split{amounts} = do
+        let rest = amount - sum amounts
+        assertMsg "split quantities are not more than the available amount" $ rest >= 0.0
+        splitCids <- forA amounts $ \q -> toInterfaceContractId <$> create this with amount = q
+        rest <- if rest == 0.0 then pure None else Some . toInterfaceContractId <$> create this with amount = rest
+        pure $ Fungible.SplitResult with splitCids; rest
+      merge Fungible.Merge{fungibleCids} = do
+        let
+          f qty cid = do
+            Some (fungibleCid, fungible) <- fetchFromInterface @Holding cid
+            archive fungibleCid
+            instrument === fungible.instrument
+            pure $ qty + fungible.amount
+        tot <- foldlA f amount fungibleCids
+        toInterfaceContractId <$> create this with amount = tot
+
+
+instance HoldingFactory.HasImplementation HoldingFactory
+-- | Implementation of the corresponding Holding Factory.
+template HoldingFactory
+  with
+    provider: Party
+    observers: Observers
+  where
+    signatory provider
+
+    key provider : Party
+    maintainer key
+
+    interface instance HoldingFactory.F for HoldingFactory
+      where
+        asDisclosure = toInterface @Disclosure.I this
+        view = HoldingFactory.View with provider
+        create' HoldingFactory.Create{instrument; account; amount; observers} =
+          toInterfaceContractId <$> create Holding with instrument; account; amount; observers; lock = None
+        remove HoldingFactory.Remove{actors; holdingCid} = archive $ fromInterfaceContractId @Holding holdingCid
+
+    interface instance Disclosure.I for HoldingFactory where
+      view = Disclosure.View with disclosureControllers = S.singleton $ S.singleton provider; observers
+      setObservers Disclosure.SetObservers{newObservers} = toInterfaceContractId <$> create this with observers = newObservers
+      archive' self = archive (coerceContractId self : ContractId Holding)

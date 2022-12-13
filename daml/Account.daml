@@ -1,0 +1,91 @@
+module Account where
+
+import DA.Map qualified as M (empty)
+import qualified DA.Set as S  (fromList, singleton)
+
+import Daml.Finance.Interface.Types.Common (InstrumentKey, AccountKey(..), Id(..), Observers)
+import Daml.Finance.Interface.Holding.Account qualified as Account (Credit(..), Debit(..), GetCid(..), I, R, View(..), createReference, disclosureUpdateReference, exerciseInterfaceByKey)
+import Daml.Finance.Interface.Holding.Factory.Holding qualified as HoldingFactory (Create(..), F, Remove(..))
+import Daml.Finance.Interface.Holding.Factory.Account qualified as AccountFactory (Create(..), F, HasImplementation, Remove(..), View(..))
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I, flattenObservers, SetObservers(..), View(..))
+import qualified Daml.Finance.Interface.Instrument.Base.Instrument as Instrument
+import qualified Daml.Finance.Interface.Holding.Base
+
+
+template Account
+  with
+    custodian : Party
+    owner : Party
+    id : Id
+    description : Text
+    holdingFactoryCid: ContractId HoldingFactory.F
+    observers : Observers
+  where
+    signatory custodian, owner
+    observer Disclosure.flattenObservers observers
+
+
+    let account = AccountKey with custodian; owner; id
+
+    interface instance Account.I for Account where
+      asDisclosure = toInterface @Disclosure.I this
+      view = Account.View with custodian; id; owner; holdingFactoryCid; description
+      getKey = account
+      credit Account.Credit{quantity} =
+        exercise holdingFactoryCid HoldingFactory.Create with
+          instrument = quantity.unit
+          account
+          amount = quantity.amount
+          observers = M.empty
+      debit Account.Debit{holdingCid} =
+        exercise holdingFactoryCid HoldingFactory.Remove with actors = S.fromList [account.custodian, account.owner]; holdingCid
+
+    interface instance Disclosure.I for Account where
+      view = Disclosure.View with disclosureControllers = S.fromList [S.singleton owner, S.singleton custodian]; observers
+      setObservers Disclosure.SetObservers{newObservers} = do
+        cid <- create this with observers = newObservers
+        Account.disclosureUpdateReference newObservers account (toInterfaceContractId @Account.I cid)
+      archive' self = archive (coerceContractId self : ContractId Account)
+
+    nonconsuming choice CreditHolding : (ContractId
+                             Daml.Finance.Interface.Holding.Base.Base)
+      with 
+        instrumentKey: InstrumentKey
+        amt: Int
+      controller custodian, owner
+        do
+          Account.exerciseInterfaceByKey @Account.I (AccountKey with ..) custodian Account.Credit
+           with quantity = Instrument.qty (intToNumeric amt) instrumentKey
+
+instance AccountFactory.HasImplementation AccountFactory
+-- | Template used to create accounts.
+template AccountFactory
+  with
+    provider : Party
+      -- ^ The factory's provider.
+    observers : Observers
+      -- ^ The factory's observers.
+  where
+    signatory provider
+    observer Disclosure.flattenObservers observers
+
+    key provider : Party
+    maintainer key
+
+    interface instance AccountFactory.F for AccountFactory where
+      asDisclosure = toInterface @Disclosure.I this
+      view = AccountFactory.View with provider
+      create' AccountFactory.Create{account; holdingFactoryCid; observers; description} = do
+        cid <- toInterfaceContractId <$> create Account with custodian = account.custodian; owner = account.owner; id = account.id; holdingFactoryCid; observers; description
+        Account.createReference account.custodian cid
+        pure cid
+      remove AccountFactory.Remove{account} = do
+        (refCid, ref) <- fetchByKey @Account.R account
+        accountCid <- exercise refCid Account.GetCid with viewer = account.custodian
+        archive $ fromInterfaceContractId @Account accountCid
+        archive refCid
+
+    interface instance Disclosure.I for AccountFactory where
+      view = Disclosure.View with disclosureControllers = S.singleton $ S.singleton provider; observers
+      setObservers Disclosure.SetObservers{newObservers} = toInterfaceContractId <$> create this with observers = newObservers
+      archive' self = archive (coerceContractId self : ContractId Account)
